@@ -8,14 +8,17 @@
  *            產生訂單編號、寫入「訂單」與「訂單明細」、寄通知信
  *  - doGet ：健康檢查；或以 ?orderNo=...&phone=... 查詢訂單狀態
  *  - setup ：建立／整理工作表（標題、格式、狀態下拉選單、每日統計）
- *  - onOpen：試算表上方新增「🥟 煎和鍋貼」選單
- *  - onEdit：修改訂單狀態時自動記錄「狀態更新時間」
+ *  - handleOpen：試算表上方新增「🥟 煎和鍋貼」選單（由 setup 自動掛上）
+ *  - handleEdit：修改訂單狀態時自動記錄「狀態更新時間」（由 setup 自動掛上）
  */
 
 /* ============================================================
  * 1. 設定（價格、門市需與官網 index.html 一致）
  * ============================================================ */
 const CONFIG = {
+  // 訂單要寫入的試算表 ID（網址 /d/ 和 /edit 中間那一段）
+  // 有填就一律寫到這份試算表，不管 Apps Script 是從哪裡建立的
+  SPREADSHEET_ID: '1LmZvt1E_fzqSe9U3a7UEzgyRk2yCau_tBLgVgyrhdug',
   SHOP_NAME: '煎和鍋貼',
   TIMEZONE: 'Asia/Taipei',
   SHIPPING_FEE: 150,
@@ -113,13 +116,24 @@ function doPost(e) {
   } catch (err) {
     const isUser = err && err.userMessage;
     if (!isUser) console.error(err);
-    return json_({ ok: false, error: isUser ? err.userMessage : '系統忙碌中，請稍後再試或來電訂購。' });
+    return json_({ ok: false, error: isUser ? err.userMessage : '系統忙碌中，請稍後再試或來電訂購。',
+                   detail: isUser ? undefined : String(err && err.message || err).slice(0, 200) });
   }
 }
 
 function doGet(e) {
   const p = (e && e.parameter) || {};
-  if (!p.orderNo) return json_({ ok: true, service: CONFIG.SHOP_NAME + ' 訂單 API', time: now_().text });
+  if (!p.orderNo) {
+    const info = { ok: true, service: CONFIG.SHOP_NAME + ' 訂單 API', time: now_().text };
+    try {
+      const ss = ss_();
+      info.spreadsheet = ss.getName();
+      info.ready = !!ss.getSheetByName(SHEET.ORDERS);
+    } catch (err) {
+      info.ok = false; info.spreadsheetError = String(err.message || err);
+    }
+    return json_(info);
+  }
 
   // 查詢訂單狀態：需同時提供訂單編號與手機，避免他人亂查
   const phone = normPhone_(p.phone || '');
@@ -263,7 +277,7 @@ function notifyShop_(o) {
     '商品小計 NT$' + o.subtotal + '　運費 NT$' + o.shipping,
     '應付總額 NT$' + o.total,
     '',
-    '試算表：' + SpreadsheetApp.getActiveSpreadsheet().getUrl()
+    '試算表：' + ss_().getUrl()
   ].filter(function (l, i, a) { return l !== '' || a[i - 1] !== ''; }).join('\n');
   MailApp.sendEmail({
     to: to,
@@ -275,7 +289,7 @@ function notifyShop_(o) {
 /* ============================================================
  * 6. 試算表工具：選單、初始化、狀態時間、今日報表
  * ============================================================ */
-function onOpen() {
+function handleOpen() {
   SpreadsheetApp.getUi()
     .createMenu('🥟 煎和鍋貼')
     .addItem('初始化／整理工作表', 'setup')
@@ -285,7 +299,7 @@ function onOpen() {
     .addToUi();
 }
 
-function onEdit(e) {
+function handleEdit(e) {
   const r = e && e.range;
   if (!r || r.getSheet().getName() !== SHEET.ORDERS || r.getRow() < 2) return;
   if (r.getColumn() <= COL['狀態'] && r.getLastColumn() >= COL['狀態']) {
@@ -294,7 +308,16 @@ function onEdit(e) {
 }
 
 function setup() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  buildSheets_();
+  installTriggers_();
+  const url = ss_().getUrl();
+  console.log('✅ 工作表已建立完成：' + url);
+  try { SpreadsheetApp.getUi().alert('✅ 工作表已建立完成！\n\n' + url); } catch (e) { /* 從編輯器執行時沒有 UI */ }
+}
+
+// 建立／整理三個工作表（訂單、訂單明細、每日統計）
+function buildSheets_() {
+  const ss = ss_();
   ss.setSpreadsheetTimeZone(CONFIG.TIMEZONE);
 
   // 訂單
@@ -348,8 +371,17 @@ function setup() {
   const blank = ss.getSheetByName('工作表1') || ss.getSheetByName('Sheet1');
   if (blank && ss.getSheets().length > 1 && blank.getLastRow() === 0) ss.deleteSheet(blank);
   ss.setActiveSheet(o);
+}
 
-  try { SpreadsheetApp.getUi().alert('✅ 工作表已建立完成！接下來請依 README 部署成網頁應用程式。'); } catch (e) { /* 從編輯器執行時沒有 UI */ }
+// 把「🥟 煎和鍋貼」選單與狀態時間記錄掛到訂單試算表上（不論程式是從哪裡建立的）
+function installTriggers_() {
+  const ss = ss_();
+  const wanted = { handleOpen: ScriptApp.EventType.ON_OPEN, handleEdit: ScriptApp.EventType.ON_EDIT };
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (wanted[t.getHandlerFunction()]) ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('handleOpen').forSpreadsheet(ss).onOpen().create();
+  ScriptApp.newTrigger('handleEdit').forSpreadsheet(ss).onEdit().create();
 }
 
 function ensureSheet_(ss, name, headers) {
@@ -381,7 +413,7 @@ function sendTodayReport() {
     '取餐方式：' + (Object.keys(byMode).map(k => k + ' ' + byMode[k] + ' 筆').join('、') || '—'),
     '尚待處理：' + pending + ' 筆',
     '',
-    '試算表：' + SpreadsheetApp.getActiveSpreadsheet().getUrl()
+    '試算表：' + ss_().getUrl()
   ].join('\n');
   const to = CONFIG.NOTIFY_EMAIL || Session.getEffectiveUser().getEmail();
   MailApp.sendEmail({ to: to, subject: '【' + CONFIG.SHOP_NAME + '】' + today + ' 營收報表｜NT$' + revenue.toLocaleString(), body: body });
@@ -401,9 +433,16 @@ function createSampleOrder() {
 /* ============================================================
  * 7. 小工具
  * ============================================================ */
+function ss_() {
+  if (CONFIG.SPREADSHEET_ID) return SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const active = SpreadsheetApp.getActiveSpreadsheet();
+  if (!active) throw new Error('找不到試算表：請在 CONFIG.SPREADSHEET_ID 填入試算表 ID');
+  return active;
+}
+
 function sheet_(name) {
-  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
-  if (!sh) throw new Error('找不到工作表「' + name + '」，請先執行 setup');
+  let sh = ss_().getSheetByName(name);
+  if (!sh) { buildSheets_(); sh = ss_().getSheetByName(name); } // 還沒執行 setup 時自動建立
   return sh;
 }
 
