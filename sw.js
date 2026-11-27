@@ -4,7 +4,7 @@
  * - CDN（Tailwind、Lucide、Three.js、字型、圖片）：先用快取、背景更新
  * 每次修改網站檔案後，請把 VERSION 加一，舊快取會自動清除。
  */
-const VERSION = 'v2';
+const VERSION = 'v3';
 const CACHE = `jianhe-${VERSION}`;
 const PRECACHE = [
   './',
